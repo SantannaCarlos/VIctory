@@ -551,6 +551,9 @@ impl State {
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        if x != 0 && y != 0 && z != 0 {
+            list.record_command_writes();
+        }
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -603,6 +606,9 @@ impl State {
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, 1, 1) };
+                    if x != 0 {
+                        list.record_command_writes();
+                    }
                     DRAWN.fetch_add(1, Ordering::Relaxed);
                     true
                 }
@@ -866,6 +872,9 @@ impl State {
                 list.list
                     .DrawInstanced(count, instances, from, first_instance)
             };
+            if count != 0 && instances != 0 {
+                list.record_command_writes();
+            }
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -953,6 +962,9 @@ impl State {
                 list.list
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
+            if indices != 0 && instances != 0 {
+                list.record_command_writes();
+            }
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -1052,6 +1064,7 @@ impl State {
             (&args.buffer, args.offset(arguments)),
             counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at))),
         );
+        list.record_command_writes();
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -1134,23 +1147,39 @@ fn readable(
         && let Some((address, len)) = crate::descriptor::host::buffer_range(view)
         && len > 0
     {
-        let fed = (u.kind == ResourceType::Srv)
-            .then(|| copy.fed_from())
-            .flatten();
-        if let Some(from) = fed {
-            from.refresh(list, address, len);
-            // The view's copy holds its whole range, so `len` bytes fit it.
-            let len = len.min(from.left(address));
-            list.copy_buffer(&copy.buffer, &from.buffer, from.offset(address), len);
-            list.buffer_state(&copy.buffer, crate::host::BUFFER_READ);
-        } else {
+        if u.kind == ResourceType::Uav {
             copy.refresh(list, address, len);
-            if u.kind == ResourceType::Uav {
-                copy.gpu_writes(list, address, len);
-                list.buffer_state(&copy.buffer, crate::host::BUFFER_WRITE);
-            } else {
-                list.buffer_state(&copy.buffer, crate::host::BUFFER_READ);
+            copy.gpu_writes(list, address, len);
+            list.buffer_state(&copy.buffer, crate::host::BUFFER_WRITE);
+        } else {
+            let mut copied_whole = false;
+            if u.kind == ResourceType::Srv
+                && let Some(parent) = copy.parent()
+            {
+                let end = address + len.min(parent.left(address)).min(copy.left(address));
+                let view = address as usize..end as usize;
+                // Preserve the learned path, including writes from earlier
+                // lists in the same submission. Before the first copyback,
+                // copy only ranges written by earlier commands in this list.
+                let ranges = if !view.is_empty() && copy.fed_from().is_some() {
+                    vec![view]
+                } else {
+                    list.recorded_gpu_writes(parent, view)
+                };
+                if !ranges.is_empty() {
+                    copied_whole = ranges.len() == 1
+                        && ranges[0].start == address as usize
+                        && ranges[0].end == (address + len) as usize;
+                    for range in &ranges {
+                        parent.refresh(list, range.start as u64, range.len() as u64);
+                    }
+                    list.copy_buffer_ranges(copy, parent, &ranges);
+                }
             }
+            if !copied_whole {
+                copy.refresh(list, address, len);
+            }
+            list.buffer_state(&copy.buffer, crate::host::BUFFER_READ);
         }
     }
     match (view, u.kind) {

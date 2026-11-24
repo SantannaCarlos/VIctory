@@ -4,6 +4,7 @@
 //! shortcut: every submission is waited for, so CPU and GPU never overlap;
 //! overlap them with per-submission fences once more than clears run.
 
+use std::ops::Range;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -904,6 +905,10 @@ enum Step {
 struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
+    /// Beginning of this command's deferred work, and ranges declared by
+    /// commands that have actually been recorded in this list.
+    command_start: usize,
+    recorded_gpu_writes: std::collections::HashMap<usize, Vec<Range<usize>>>,
     uploads: Vec<ID3D12Resource>,
     /// Host objects the list's commands name (pipelines, root signatures,
     /// descriptor heaps): the title may release its objects before it
@@ -1458,6 +1463,55 @@ impl HostList {
     /// dispatch): see [`BufferStates`].
     pub(crate) fn begin_command(&self) {
         self.buffers.lock().unwrap_or_else(|e| e.into_inner()).next_command();
+        let mut deferred = self.deferred();
+        deferred.command_start = deferred.copies.len();
+    }
+
+    /// Keep the ranges of recorded GPU commands separate from the
+    /// declarations of an in-progress or declined bind.
+    pub(crate) fn record_command_writes(&self) {
+        let deferred = &mut *self.deferred();
+        for step in &deferred.copies[deferred.command_start..] {
+            let Step::GpuWrite(shadow, address, len) = step else {
+                continue;
+            };
+            if *len == 0 {
+                continue;
+            }
+            let ranges = deferred.recorded_gpu_writes
+                .entry(std::sync::Arc::as_ptr(shadow) as usize)
+                .or_default();
+            let end = address.saturating_add(*len);
+            let first = ranges.partition_point(|r| r.end < *address);
+            let last = first + ranges[first..].partition_point(|r| r.start <= end);
+            if first == last {
+                ranges.insert(first, *address..end);
+            } else {
+                let start = ranges[first].start.min(*address);
+                let end = ranges[last - 1].end.max(end);
+                ranges[first] = start..end;
+                ranges.drain(first + 1..last);
+            }
+        }
+    }
+
+    /// Overlap of the view with earlier commands' writes to this exact copy.
+    pub(crate) fn recorded_gpu_writes(
+        &self,
+        shadow: &crate::shadow::Shadow,
+        view: Range<usize>,
+    ) -> Vec<Range<usize>> {
+        if view.is_empty() {
+            return Vec::new();
+        }
+        let deferred = self.deferred();
+        let Some(ranges) = deferred.recorded_gpu_writes.get(&(shadow as *const _ as usize)) else {
+            return Vec::new();
+        };
+        let first = ranges.partition_point(|r| r.end <= view.start);
+        ranges[first..].iter().take_while(|r| r.start < view.end)
+            .map(|r| r.start.max(view.start)..r.end.min(view.end))
+            .collect()
     }
 
     /// Moves a host copy of title memory to `wanted` ([`BUFFER_READ`] or
@@ -1475,20 +1529,16 @@ impl HostList {
         }
     }
 
-    /// Copies `len` bytes at `at` in host copy `from` to the start of host
-    /// copy `to`, in the list, before the current command: each buffer is
-    /// moved to the copy's state and back to the one the command has it in
-    /// ([`BufferStates::around_copy`]).
-    pub(crate) fn copy_buffer(
+    /// Copy overlapping view ranges while preserving both buffers' binding states.
+    pub(crate) fn copy_buffer_ranges(
         &self,
-        to: &ID3D12Resource,
-        from: &ID3D12Resource,
-        at: u64,
-        len: u64,
+        dst: &crate::shadow::Shadow,
+        src: &crate::shadow::Shadow,
+        ranges: &[Range<usize>],
     ) {
         let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
         let (mut there, mut back) = (Vec::new(), Vec::new());
-        for (buffer, state) in [(from, BUFFER_COPY_SOURCE), (to, BUFFER_COPY_DEST)] {
+        for (buffer, state) in [(&src.buffer, BUFFER_COPY_SOURCE), (&dst.buffer, BUFFER_COPY_DEST)] {
             let key = buffer.as_raw() as usize;
             if let Some(now) = buffers.around_copy(key, buffer.clone(), state) {
                 let (now, state) = (
@@ -1500,13 +1550,17 @@ impl HostList {
             }
         }
         // SAFETY: an open list; both buffers are host copies the list holds
-        // (its buffer states keep them), with `len` bytes from `at` in `from`
-        // and from the start in `to`.
+        // (its buffer states keep them), with each range inside both copies.
         unsafe {
             if !there.is_empty() {
                 self.list.ResourceBarrier(&there);
             }
-            self.list.CopyBufferRegion(to, 0, from, at, len);
+            for range in ranges {
+                let at = range.start as u64;
+                self.list.CopyBufferRegion(
+                    &dst.buffer, dst.offset(at), &src.buffer, src.offset(at), range.len() as u64,
+                );
+            }
             if !back.is_empty() {
                 self.list.ResourceBarrier(&back);
             }

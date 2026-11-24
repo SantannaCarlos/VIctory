@@ -172,6 +172,12 @@ impl Shadow {
         }
     }
 
+    /// The exact buffer copy the view was cut from, even before copyback
+    /// observes a GPU write.
+    pub(crate) fn parent(&self) -> Option<&Arc<Shadow>> {
+        self.cut_from.as_ref().map(|(from, _)| from)
+    }
+
     /// For a copy of just a view's bytes whose bytes shaders write in the
     /// buffer's copy it was cut from: that copy. A read through the view
     /// then copies from it on the GPU, inside the list, to see what the
@@ -658,6 +664,44 @@ mod tests {
         // SAFETY: a live buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
         Some(Arc::new(Shadow::new(buffer, data, gpu, address, len)))
+    }
+
+    #[test]
+    fn aligned_srv_uses_only_prior_recorded_writes_to_its_parent() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let memory = [0u32; 32];
+        let start = memory.as_ptr() as usize;
+        let parent = buffer_copy(start as u64, 128).expect("a buffer copy");
+        let other = buffer_copy(start as u64, 128).expect("a distinct buffer copy");
+        let own = aligned((start + 48) as u64, 56, &parent).expect("an aligned view copy");
+        let list = host.new_list().expect("a command list");
+        let writes = || list.recorded_gpu_writes(own.parent().unwrap(), start + 48..start + 104);
+
+        list.begin_command();
+        parent.gpu_writes(&list, (start + 44) as u64, 8);
+        assert!(writes().is_empty(), "the current command has not been recorded");
+        list.record_command_writes();
+        let recorded = writes();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0], start + 48..start + 52);
+
+        list.begin_command();
+        parent.gpu_writes(&list, (start + 56) as u64, 16);
+        // This command is declined; its declared range must not become a producer.
+        list.begin_command();
+        parent.gpu_writes(&list, (start + 52) as u64, 4);
+        parent.gpu_writes(&list, (start + 100) as u64, 8);
+        other.gpu_writes(&list, (start + 56) as u64, 44);
+        list.record_command_writes();
+        assert_eq!(writes(), [start + 48..start + 56, start + 100..start + 104]);
+        assert!(own.fed_from().is_none(), "recording did not publish a completed write");
+
+        list.close();
+        list.reset();
+        assert!(writes().is_empty(), "a reset discards recorded producers");
+        assert!(own.fed_from().is_none());
     }
 
     #[test]
